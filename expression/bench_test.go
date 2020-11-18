@@ -190,8 +190,8 @@ func BenchmarkVectorizedExecute(b *testing.B) {
 
 func BenchmarkScalarFunctionClone(b *testing.B) {
 	col := &Column{RetType: types.NewFieldType(mysql.TypeLonglong)}
-	con1 := One.Clone()
-	con2 := Zero.Clone()
+	con1 := NewOne()
+	con2 := NewZero()
 	add := NewFunctionInternal(mock.NewContext(), ast.Plus, types.NewFieldType(mysql.TypeLonglong), col, con1)
 	sub := NewFunctionInternal(mock.NewContext(), ast.Plus, types.NewFieldType(mysql.TypeLonglong), add, con2)
 	b.ResetTimer()
@@ -780,10 +780,10 @@ func (g *dateStrGener) gen() interface{} {
 		g.Year = 1970 + g.randGen.Intn(100)
 	}
 	if g.Month == 0 {
-		g.Month = g.randGen.Intn(10) + 1
+		g.Month = g.randGen.Intn(10)
 	}
 	if g.Day == 0 {
-		g.Day = g.randGen.Intn(20) + 1
+		g.Day = g.randGen.Intn(20)
 	}
 
 	return fmt.Sprintf("%d-%d-%d", g.Year, g.Month, g.Day)
@@ -1244,6 +1244,20 @@ func genVecBuiltinFuncBenchCase(ctx sessionctx.Context, funcName string, testCas
 			fc = &castAsStringFunctionClass{baseFunctionClass{ast.Cast, 1, 1}, tp}
 		}
 		baseFunc, err = fc.getFunction(ctx, cols)
+	} else if funcName == ast.GetVar {
+		var fc functionClass
+		tp := eType2FieldType(testCase.retEvalType)
+		switch testCase.retEvalType {
+		case types.ETInt:
+			fc = &getIntVarFunctionClass{getVarFunctionClass{baseFunctionClass{ast.GetVar, 1, 1}, tp}}
+		case types.ETDecimal:
+			fc = &getDecimalVarFunctionClass{getVarFunctionClass{baseFunctionClass{ast.GetVar, 1, 1}, tp}}
+		case types.ETReal:
+			fc = &getRealVarFunctionClass{getVarFunctionClass{baseFunctionClass{ast.GetVar, 1, 1}, tp}}
+		default:
+			fc = &getStringVarFunctionClass{getVarFunctionClass{baseFunctionClass{ast.GetVar, 1, 1}, tp}}
+		}
+		baseFunc, err = fc.getFunction(ctx, cols)
 	} else {
 		baseFunc, err = funcs[funcName].getFunction(ctx, cols)
 	}
@@ -1308,12 +1322,12 @@ func testVectorizedBuiltinFunc(c *C, vecExprCases vecExprBenchCases) {
 					types.NewTimeDatum(types.NewTime(types.FromGoTime(testTime), mysql.TypeTimestamp, 6)),
 					types.NewDurationDatum(types.ZeroDuration),
 					types.NewStringDatum("{}"),
-					types.NewBinaryLiteralDatum(types.BinaryLiteral([]byte{1})),
+					types.NewBinaryLiteralDatum([]byte{1}),
 					types.NewBytesDatum([]byte{'b'}),
 					types.NewFloat32Datum(1.1),
 					types.NewFloat64Datum(2.1),
 					types.NewUintDatum(100),
-					types.NewMysqlBitDatum(types.BinaryLiteral([]byte{1})),
+					types.NewMysqlBitDatum([]byte{1}),
 					types.NewMysqlEnumDatum(types.Enum{Name: "n", Value: 2}),
 				}
 			}
@@ -1527,12 +1541,12 @@ func benchmarkVectorizedBuiltinFunc(b *testing.B, vecExprCases vecExprBenchCases
 					types.NewTimeDatum(types.NewTime(types.FromGoTime(testTime), mysql.TypeTimestamp, 6)),
 					types.NewDurationDatum(types.ZeroDuration),
 					types.NewStringDatum("{}"),
-					types.NewBinaryLiteralDatum(types.BinaryLiteral([]byte{1})),
+					types.NewBinaryLiteralDatum([]byte{1}),
 					types.NewBytesDatum([]byte{'b'}),
 					types.NewFloat32Datum(1.1),
 					types.NewFloat64Datum(2.1),
 					types.NewUintDatum(100),
-					types.NewMysqlBitDatum(types.BinaryLiteral([]byte{1})),
+					types.NewMysqlBitDatum([]byte{1}),
 					types.NewMysqlEnumDatum(types.Enum{Name: "n", Value: 2}),
 				}
 			}
@@ -1794,21 +1808,6 @@ func (s *testVectorizeSuite2) TestVecEvalBool(c *C) {
 			}
 		}
 	}
-}
-
-func (s *testVectorizeSuite2) TestVecToBool(c *C) {
-	ctx := mock.NewContext()
-	buf := chunk.NewColumn(eType2FieldType(types.ETString), 2)
-	buf.ReserveString(1)
-	buf.AppendString("999999999999999999923")
-	c.Assert(toBool(ctx.GetSessionVars().StmtCtx, types.ETString, buf, []int{0, 1}, []int8{0, 0}), NotNil)
-	buf.ReserveString(1)
-	buf.AppendString("23")
-	c.Assert(toBool(ctx.GetSessionVars().StmtCtx, types.ETString, buf, []int{0, 1}, []int8{0, 0}), IsNil)
-	buf.ReserveString(2)
-	buf.AppendString("999999999999999999923")
-	buf.AppendString("23")
-	c.Assert(toBool(ctx.GetSessionVars().StmtCtx, types.ETString, buf, []int{0, 1}, []int8{0, 0}), NotNil)
 }
 
 func BenchmarkVecEvalBool(b *testing.B) {

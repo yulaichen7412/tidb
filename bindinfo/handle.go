@@ -56,7 +56,7 @@ type BindHandle struct {
 	// bindInfo caches the sql bind info from storage.
 	//
 	// The Mutex protects that there is only one goroutine changes the content
-	// of atmoic.Value.
+	// of atomic.Value.
 	//
 	// NOTE: Concurrent Value Write:
 	//
@@ -125,7 +125,7 @@ func (h *BindHandle) Update(fullLoad bool) (err error) {
 	lastUpdateTime := h.bindInfo.lastUpdateTime
 	h.bindInfo.Unlock()
 
-	sql := "select original_sql, bind_sql, default_db, status, create_time, update_time, charset, collation from mysql.bind_info"
+	sql := "select original_sql, bind_sql, default_db, status, create_time, update_time, charset, collation, source from mysql.bind_info"
 	if !fullLoad {
 		sql += " where update_time > \"" + lastUpdateTime.String() + "\""
 	}
@@ -462,6 +462,7 @@ func (h *BindHandle) newBindRecord(row chunk.Row) (string, *BindRecord, error) {
 		UpdateTime: row.GetTime(5),
 		Charset:    row.GetString(6),
 		Collation:  row.GetString(7),
+		Source:     row.GetString(8),
 	}
 	bindRecord := &BindRecord{
 		OriginalSQL: row.GetString(0),
@@ -567,7 +568,7 @@ func (h *BindHandle) deleteBindInfoSQL(normdOrigSQL, db, bindSQL string) string 
 }
 
 func (h *BindHandle) insertBindInfoSQL(orignalSQL string, db string, info Binding) string {
-	return fmt.Sprintf(`INSERT INTO mysql.bind_info VALUES (%s, %s, %s, %s, %s, %s, %s, %s)`,
+	return fmt.Sprintf(`INSERT INTO mysql.bind_info VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)`,
 		expression.Quote(orignalSQL),
 		expression.Quote(info.BindSQL),
 		expression.Quote(db),
@@ -576,6 +577,7 @@ func (h *BindHandle) insertBindInfoSQL(orignalSQL string, db string, info Bindin
 		expression.Quote(info.UpdateTime.String()),
 		expression.Quote(info.Charset),
 		expression.Quote(info.Collation),
+		expression.Quote(info.Source),
 	)
 }
 
@@ -594,16 +596,19 @@ func (h *BindHandle) logicalDeleteBindInfoSQL(originalSQL, db string, updateTs t
 // CaptureBaselines is used to automatically capture plan baselines.
 func (h *BindHandle) CaptureBaselines() {
 	parser4Capture := parser.New()
-	schemas, sqls := stmtsummary.StmtSummaryByDigestMap.GetMoreThanOnceSelect()
+	schemas, sqls := stmtsummary.StmtSummaryByDigestMap.GetMoreThanOnceBindableStmt()
 	for i := range sqls {
 		stmt, err := parser4Capture.ParseOneStmt(sqls[i], "", "")
 		if err != nil {
 			logutil.BgLogger().Debug("parse SQL failed", zap.String("SQL", sqls[i]), zap.Error(err))
 			continue
 		}
-		normalizedSQL, digiest := parser.NormalizeDigest(sqls[i])
+		if insertStmt, ok := stmt.(*ast.InsertStmt); ok && insertStmt.Select == nil {
+			continue
+		}
+		normalizedSQL, digest := parser.NormalizeDigest(sqls[i])
 		dbName := utilparser.GetDefaultDB(stmt, schemas[i])
-		if r := h.GetBindRecord(digiest, normalizedSQL, dbName); r != nil && r.HasUsingBinding() {
+		if r := h.GetBindRecord(digest, normalizedSQL, dbName); r != nil && r.HasUsingBinding() {
 			continue
 		}
 		h.sctx.Lock()
@@ -628,6 +633,7 @@ func (h *BindHandle) CaptureBaselines() {
 			Status:    Using,
 			Charset:   charset,
 			Collation: collation,
+			Source:    Capture,
 		}
 		// We don't need to pass the `sctx` because the BindSQL has been validated already.
 		err = h.AddBindRecord(nil, &BindRecord{OriginalSQL: normalizedSQL, Db: dbName, Bindings: []Binding{binding}})
@@ -638,10 +644,10 @@ func (h *BindHandle) CaptureBaselines() {
 }
 
 func getHintsForSQL(sctx sessionctx.Context, sql string) (string, error) {
-	oriVals := sctx.GetSessionVars().UsePlanBaselines
+	origVals := sctx.GetSessionVars().UsePlanBaselines
 	sctx.GetSessionVars().UsePlanBaselines = false
 	recordSets, err := sctx.(sqlexec.SQLExecutor).ExecuteInternal(context.TODO(), fmt.Sprintf("explain format='hint' %s", sql))
-	sctx.GetSessionVars().UsePlanBaselines = oriVals
+	sctx.GetSessionVars().UsePlanBaselines = origVals
 	if len(recordSets) > 0 {
 		defer terror.Log(recordSets[0].Close())
 	}
@@ -679,10 +685,35 @@ func GenerateBindSQL(ctx context.Context, stmtNode ast.StmtNode, planHint string
 		logutil.Logger(ctx).Warn("Restore SQL failed", zap.Error(err))
 	}
 	bindSQL := sb.String()
-	selectIdx := strings.Index(bindSQL, "SELECT")
-	// Remove possible `explain` prefix.
-	bindSQL = bindSQL[selectIdx:]
-	return strings.Replace(bindSQL, "SELECT", fmt.Sprintf("SELECT /*+ %s*/", planHint), 1)
+	switch n := stmtNode.(type) {
+	case *ast.DeleteStmt:
+		deleteIdx := strings.Index(bindSQL, "DELETE")
+		// Remove possible `explain` prefix.
+		bindSQL = bindSQL[deleteIdx:]
+		return strings.Replace(bindSQL, "DELETE", fmt.Sprintf("DELETE /*+ %s*/", planHint), 1)
+	case *ast.UpdateStmt:
+		updateIdx := strings.Index(bindSQL, "UPDATE")
+		// Remove possible `explain` prefix.
+		bindSQL = bindSQL[updateIdx:]
+		return strings.Replace(bindSQL, "UPDATE", fmt.Sprintf("UPDATE /*+ %s*/", planHint), 1)
+	case *ast.SelectStmt:
+		selectIdx := strings.Index(bindSQL, "SELECT")
+		// Remove possible `explain` prefix.
+		bindSQL = bindSQL[selectIdx:]
+		return strings.Replace(bindSQL, "SELECT", fmt.Sprintf("SELECT /*+ %s*/", planHint), 1)
+	case *ast.InsertStmt:
+		insertIdx := int(0)
+		if n.IsReplace {
+			insertIdx = strings.Index(bindSQL, "REPLACE")
+		} else {
+			insertIdx = strings.Index(bindSQL, "INSERT")
+		}
+		// Remove possible `explain` prefix.
+		bindSQL = bindSQL[insertIdx:]
+		return strings.Replace(bindSQL, "SELECT", fmt.Sprintf("SELECT /*+ %s*/", planHint), 1)
+	}
+	logutil.Logger(ctx).Warn("Unexpected statement type")
+	return ""
 }
 
 type paramMarkerChecker struct {
@@ -753,6 +784,10 @@ const (
 	// acceptFactor is the factor to decide should we accept the pending verified plan.
 	// A pending verified plan will be accepted if it performs at least `acceptFactor` times better than the accepted plans.
 	acceptFactor = 1.5
+	// verifyTimeoutFactor is how long to wait to verify the pending plan.
+	// For debugging purposes it is useful to wait a few times longer than the current execution time so that
+	// an informative error can be written to the log.
+	verifyTimeoutFactor = 2.0
 	// nextVerifyDuration is the duration that we will retry the rejected plans.
 	nextVerifyDuration = 7 * 24 * time.Hour
 )
@@ -805,6 +840,7 @@ func (h *BindHandle) getRunningDuration(sctx sessionctx.Context, db, sql string,
 		return time.Since(startTime), nil
 	case <-timer.C:
 		cancelFunc()
+		logutil.BgLogger().Warn("plan verification timed out", zap.Duration("timeElapsed", time.Since(startTime)))
 	}
 	<-resultChan
 	return -1, nil
@@ -854,7 +890,7 @@ func (h *BindHandle) HandleEvolvePlanTask(sctx sessionctx.Context, adminEvolve b
 		return nil
 	}
 	sctx.GetSessionVars().UsePlanBaselines = true
-	acceptedPlanTime, err := h.getRunningDuration(sctx, db, binding.BindSQL, maxTime)
+	currentPlanTime, err := h.getRunningDuration(sctx, db, binding.BindSQL, maxTime)
 	// If we just return the error to the caller, this job will be retried again and again and cause endless logs,
 	// since it is still in the bind record. Now we just drop it and if it is actually retryable,
 	// we will hope for that we can capture this evolve task again.
@@ -863,16 +899,22 @@ func (h *BindHandle) HandleEvolvePlanTask(sctx sessionctx.Context, adminEvolve b
 	}
 	// If the accepted plan timeouts, it is hard to decide the timeout for verify plan.
 	// Currently we simply mark the verify plan as `using` if it could run successfully within maxTime.
-	if acceptedPlanTime > 0 {
-		maxTime = time.Duration(float64(acceptedPlanTime) / acceptFactor)
+	if currentPlanTime > 0 {
+		maxTime = time.Duration(float64(currentPlanTime) * verifyTimeoutFactor)
 	}
 	sctx.GetSessionVars().UsePlanBaselines = false
 	verifyPlanTime, err := h.getRunningDuration(sctx, db, binding.BindSQL, maxTime)
 	if err != nil {
 		return h.DropBindRecord(originalSQL, db, &binding)
 	}
-	if verifyPlanTime < 0 {
+	if verifyPlanTime == -1 || (float64(verifyPlanTime)*acceptFactor > float64(currentPlanTime)) {
 		binding.Status = Rejected
+		digestText, _ := parser.NormalizeDigest(binding.BindSQL) // for log desensitization
+		logutil.BgLogger().Warn("new plan rejected",
+			zap.Duration("currentPlanTime", currentPlanTime),
+			zap.Duration("verifyPlanTime", verifyPlanTime),
+			zap.String("digestText", digestText),
+		)
 	} else {
 		binding.Status = Using
 	}

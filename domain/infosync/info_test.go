@@ -18,7 +18,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path"
 	"reflect"
+	"runtime"
 	"testing"
 	"time"
 
@@ -72,6 +75,9 @@ type testSuite struct {
 }
 
 func TestTopology(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("integration.NewClusterV3 will create file contains a colon which is not allowed on Windows")
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	currentID := "test"
@@ -84,7 +90,7 @@ func TestTopology(t *testing.T) {
 	failpoint.Enable("github.com/pingcap/tidb/domain/infosync/mockServerInfo", "return(true)")
 	defer failpoint.Disable("github.com/pingcap/tidb/domain/infosync/mockServerInfo")
 
-	info, err := GlobalInfoSyncerInit(ctx, currentID, cli)
+	info, err := GlobalInfoSyncerInit(ctx, currentID, func() uint64 { return 1 }, cli, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,6 +108,9 @@ func TestTopology(t *testing.T) {
 
 	if topo.StartTimestamp != 1282967700000 {
 		t.Fatal("start_timestamp of topology info does not match")
+	}
+	if v, ok := topo.Labels["foo"]; !ok || v != "bar" {
+		t.Fatal("labels of topology info does not match")
 	}
 
 	if !reflect.DeepEqual(*topo, info.getTopologyInfo()) {
@@ -125,6 +134,17 @@ func TestTopology(t *testing.T) {
 	topo, err = info.getTopologyFromEtcd(ctx)
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	s, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := path.Dir(s)
+
+	if topo.DeployPath != dir {
+		t.Fatal("DeployPath not match expected path")
 	}
 
 	if topo.StartTimestamp != 1282967700000 {

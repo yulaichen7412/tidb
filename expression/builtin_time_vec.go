@@ -464,7 +464,9 @@ func (b *builtinUnixTimestampCurrentSig) vecEvalInt(input *chunk.Chunk, result *
 		return err
 	}
 	intVal, err := dec.ToInt()
-	terror.Log(err)
+	if !terror.ErrorEqual(err, types.ErrTruncated) {
+		terror.Log(err)
+	}
 	n := input.NumRows()
 	result.ResizeInt64(n, false)
 	intRes := result.Int64s()
@@ -1382,7 +1384,7 @@ func (b *builtinTimeToSecSig) vecEvalInt(input *chunk.Chunk, result *chunk.Colum
 			continue
 		}
 		var sign int
-		duration := buf.GetDuration(i, int(fsp))
+		duration := buf.GetDuration(i, fsp)
 		if duration.Duration >= 0 {
 			sign = 1
 		} else {
@@ -2271,7 +2273,9 @@ func (b *builtinUnixTimestampIntSig) vecEvalInt(input *chunk.Chunk, result *chun
 				return err
 			}
 			intVal, err := dec.ToInt()
-			terror.Log(err)
+			if !terror.ErrorEqual(err, types.ErrTruncated) {
+				terror.Log(err)
+			}
 			i64s[i] = intVal
 		}
 	}
